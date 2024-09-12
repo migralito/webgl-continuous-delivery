@@ -1,0 +1,68 @@
+fastlane_require 'marcel'
+
+def create_s3(options)
+  return Aws::S3::Client.new(
+    region: options[:region],
+    access_key_id: options[:access_key_id],
+    secret_access_key: options[:secret_access_key]
+  )
+end
+
+def infer_mime(filename)
+  compressed = filename.end_with?(".gz") || filename.end_with?(".br")
+  # unpack underlying extension for compressed files. IE: if file is something.js.gz, we want ext == ".js", not ".gz"
+  ext = File.extname(compressed ? filename.delete_suffix(".gz").delete_suffix(".br") : filename)
+  # 1) Marcel uses magic bytes to infer type, then use extension as fallback. Instead of that, force to use
+  # the extension criteria, given that the magic bytes strategy fails for the minified .js
+  # 2) For .data files, bypass Marcel (it returns text/plain)
+  #return compressed ? Marcel::MimeType.for(extension: ext) : Marcel::MimeType.for(Pathname.new(filename))
+  return ext == ".data" ? "application/octet-stream" : Marcel::MimeType.for(extension: ext)
+end
+
+def encoding(file_path)
+  if file_path.end_with?(".gz")
+    return "gzip"
+  elsif file_path.end_with?(".br")
+    return "br"
+  else
+    return nil
+  end
+end
+
+desc "Upload directory recursively to S3 bucket"
+lane :upload_dir_to_s3 do |options|
+  require 'aws-sdk-s3'
+
+  s3 = create_s3(options)
+  bucket = options[:bucket]
+  dir_to_upload = options[:dir_to_upload].delete_suffix("/") + "/"   # making sure we have the trailing /
+
+  files = Dir[ File.join(dir_to_upload, '**', '*') ].reject { |p| File.directory? p }
+  UI.message("About to upload to #{bucket} all files in #{dir_to_upload}: #{files}")
+  files.each do |file_path|
+    key = file_path.delete_prefix(dir_to_upload)
+    enc = encoding(file_path)
+    type = infer_mime(file_path)
+    UI.message("Uploading #{file_path} at #{key} as type=#{type} and encoding=#{enc} ...")
+    File.open(file_path, 'rb') do |file|
+      s3.put_object({ bucket: bucket, key: key, body: file, content_type: type, content_encoding: enc })
+    end
+  end
+  UI.success("File uploaded to S3 bucket successfully!")
+end
+
+desc "Empty S3 bucket"
+lane :empty_s3_bucket do |options|
+  require 'aws-sdk-s3'
+
+  s3 = create_s3(options)
+  bucket = options[:bucket]
+
+  objects_to_delete = s3.list_objects(bucket: bucket).contents.map { |object| { key: object.key } }
+  objects_to_delete.each do |obj|
+    UI.message "Deleting #{obj}..."
+  end
+  if objects_to_delete.any?
+    s3.delete_objects(bucket: bucket, delete: { objects: objects_to_delete, quiet: false })
+  end
+end
